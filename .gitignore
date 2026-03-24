@@ -205,3 +205,20 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+
+# 私钥 / 环境变量
+.env
+*.env
+~/.dacs_env_profile
+
+# 运行时数据（含钱包交易记录）
+bot.log
+scan_positions.json
+scan_trades.json
+trader_soul.json
+
+# Python 缓存
+__pycache__/
+*.pyc
+scan_live.py        # 可选：生成产物，不必上传
