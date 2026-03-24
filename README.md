@@ -14,6 +14,7 @@
 - 🧠 TraderSoul 进化型交易人格系统（只读分析，不干预交易）
 - 🖥️ 实时 Web Dashboard（端口 3241）
 - 📦 单 `.md` Skill 文件，Claude Code 一键部署
+![Uploading mermaid-diagram-2026-03-24-142610.png…]()
 
 ---
 
