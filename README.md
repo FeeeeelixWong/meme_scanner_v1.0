@@ -211,23 +211,6 @@ pkill -f scan_live.py
 
 ---
 
-## v5.3 → v1.0 核心升级
-
-| 维度 | v5.3 | v1.0 |
-|---|---|---|
-| LP 验证失败 | 放行 | ❌ 拒绝（Strict=True） |
-| BUNDLE_ATH_PCT_MAX | 30% | **22%** |
-| TOP10_HOLD_MAX | 40% | **33%** |
-| AGE_HARD_MIN | 240s | **360s** |
-| MIN_HOLDERS | 25 | **35** |
-| TP2_PCT | 25% | **45%** |
-| Trailing Stop | 固定 8% | **动态 8-20%** |
-| 动量死亡检测 | ❌ | ✅ |
-| 量能枯竭检测 | ❌ | ✅ |
-| Rejected 冷却缓存 | ❌ | ✅ 10min |
-
----
-
 ## ❓ 常见问题
 
 **Q: `WALLET_PRIVATE_KEY` 是什么格式？**
