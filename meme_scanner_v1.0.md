@@ -1,12 +1,13 @@
 ---
 name: scan-live-v1
 description: >
-  扫链策略 Live Bot v1.0.1 — 独立 Python 自动交易机器人（非 MCP 版）。
+  扫链策略 Live Bot v1.0.2 — 独立 Python 自动交易机器人（非 MCP 版）。
   v1.0: 防 rug 强化（LP严格验证/Bundle/Age/冷却表）/
   动态卖点（TP2 45%/动态Trailing 8-20%）/ 新增动量死亡与量能枯竭检测。
+  v1.0.2: 低置信/年轻盘/重复信号只观察，实时卖压与短线砸盘硬拦截。
   TraderSoul READ-ONLY 分析系统保留。
 
-version: 1.0.1
+version: 1.0.2
 validated: false
 validation_date: 2026-06-20
 validation_results: >
@@ -17,10 +18,12 @@ validation_results: >
   rejected token 10min cooldown cache.
   v1.0.1: safe-by-default dry-run mode, explicit ENABLE_LIVE_TRADING=1 gate,
   localhost dashboard binding by default, clearer env validation, atomic JSON writes.
+  v1.0.2: executable-entry gate, critical safety-data fail-closed,
+  recent sell-pressure checks, short-window crash rejection, repeated-signal downgrade.
 
 ---
 
-# 扫链策略 V1.0
+# 扫链策略 V1.0.2
 
 > ⚠️ 本 Skill 描述真实交易机器人。使用前确保已理解风险，建议先以极小仓位测试。
 
@@ -257,6 +260,21 @@ VOL_EXHAUST_RATIO      = 0.15
 
 # ── v1.0 rejected 冷却 ───────────────────────────────────────────────────────
 REJECT_SAFETY_COOLDOWN = 600
+
+# ── v1.0.2 executable-entry gates ────────────────────────────────────────────
+EXEC_MIN_CONFIDENCE       = 60
+YOUNG_EXEC_MIN_AGE        = 15 * 60
+YOUNG_EXEC_MIN_CONFIDENCE = 70
+NEAR_MIGRATION_MIN_CONF   = 70
+REPEAT_SIGNAL_COOLDOWN    = 10 * 60
+
+# ── v1.0.2 short-window rug pressure checks ─────────────────────────────────
+RECENT_CRASH_DROP_PCT       = 35
+LIVE_CANDLE_DUMP_PCT        = 25
+SELL_PRESSURE_LOOKBACK      = 30
+SELL_PRESSURE_RATIO_MAX     = 2.2
+SELL_PRESSURE_CONSEC_MAX    = 6
+SELL_PRESSURE_TOP_SHARE_MAX = 0.35
 
 # ── 协议支持 ──────────────────────────────────────────────────────────────────
 PROTOCOL_PUMPFUN    = "120596"
@@ -600,7 +618,7 @@ def _default_soul() -> dict:
         "hour_stats":      {},
         "personal_limits": {
             "bundle_ath_pct_warn": 35,
-            "min_confidence_trust": 50,
+            "min_confidence_trust": EXEC_MIN_CONFIDENCE,
         },
         "win_philosophy":  "I haven't found my edge yet. Every trade is a lesson.",
         "risk_philosophy": "The market owes me nothing. Protect the bag first.",
@@ -1102,6 +1120,134 @@ def check_vol_exhaustion(addr: str, entry_vol_5m: float) -> tuple:
         pass
 
     return False, ""
+
+
+# ── v1.0.2: entry-quality and rug-pressure helpers ──────────────────────────
+_recent_signal_seen: dict = {}
+
+def _remember_signal(addr: str) -> tuple:
+    """
+    Returns (is_repeat, seconds_since_last_signal) and records the current signal.
+    Repeated signals are useful for observation, but they should not be treated as
+    extra conviction on fast pump.fun launches.
+    """
+    now = time.time()
+    last = _recent_signal_seen.get(addr)
+    _recent_signal_seen[addr] = now
+
+    expired = [k for k, v in _recent_signal_seen.items()
+               if now - v > REPEAT_SIGNAL_COOLDOWN * 2]
+    for k in expired:
+        del _recent_signal_seen[k]
+
+    if last is None:
+        return False, None
+    return (now - last) < REPEAT_SIGNAL_COOLDOWN, now - last
+
+def check_recent_crash(candles: list) -> tuple:
+    """
+    Reject recent high-to-close dumps before they become a formal position exit.
+    This catches the CROGS-style sell cascade where a token can still have noisy
+    buy pressure while price has already broken structurally.
+    """
+    if not candles or len(candles) < 3:
+        return False, ""
+
+    try:
+        live = candles[0]
+        live_open = float(live[1])
+        live_close = float(live[4])
+        live_drop = (live_close - live_open) / max(live_open, 1e-12) * 100
+        if live_drop <= -LIVE_CANDLE_DUMP_PCT:
+            return True, f"LIVE_DUMP {live_drop:.0f}%"
+
+        recent = candles[:3]
+        recent_high = max(float(c[2]) for c in recent)
+        current_close = live_close
+        drop_from_recent_high = (recent_high - current_close) / max(recent_high, 1e-12) * 100
+        if drop_from_recent_high >= RECENT_CRASH_DROP_PCT:
+            return True, f"RECENT_HIGH_DROP {drop_from_recent_high:.0f}%"
+
+        for c in recent:
+            high = float(c[2])
+            close = float(c[4])
+            candle_drop = (high - close) / max(high, 1e-12) * 100
+            if candle_drop >= RECENT_CRASH_DROP_PCT:
+                return True, f"CANDLE_HIGH_DUMP {candle_drop:.0f}%"
+    except (TypeError, ValueError, ZeroDivisionError):
+        return False, ""
+
+    return False, ""
+
+def check_recent_sell_pressure(raw_trades: list) -> tuple:
+    """
+    Uses only public trade flow. A token with enough raw activity for signal A
+    can still be a bad entry if the newest flow is concentrated selling.
+    """
+    recent = raw_trades[:SELL_PRESSURE_LOOKBACK]
+    if len(recent) < 10:
+        return False, ""
+
+    sell_count = 0
+    buy_count = 0
+    sell_vol = 0.0
+    buy_vol = 0.0
+    seller_vol = defaultdict(float)
+    consecutive_sells = 0
+
+    for i, tr in enumerate(recent):
+        typ = str(tr.get("type", "")).lower()
+        vol = float(tr.get("volume", 0) or 0)
+        if typ == "sell":
+            sell_count += 1
+            sell_vol += vol
+            seller_vol[tr.get("userAddress", f"unknown-{i}")] += vol
+            if i == consecutive_sells:
+                consecutive_sells += 1
+        elif typ == "buy":
+            buy_count += 1
+            buy_vol += vol
+
+    sell_ratio = sell_vol / max(buy_vol, 1e-9)
+    top_seller_share = max(seller_vol.values()) / max(sell_vol, 1e-9) if seller_vol else 0.0
+
+    if consecutive_sells >= SELL_PRESSURE_CONSEC_MAX:
+        return True, f"SELL_STREAK {consecutive_sells}"
+    if sell_count >= 8 and sell_ratio >= SELL_PRESSURE_RATIO_MAX:
+        return True, f"SELL_PRESSURE {sell_ratio:.1f}x ({sell_count}S/{buy_count}B)"
+    if sell_vol > 0 and top_seller_share >= SELL_PRESSURE_TOP_SHARE_MAX and sell_ratio >= 1.2:
+        return True, f"TOP_SELLER_SHARE {top_seller_share*100:.0f}%"
+
+    return False, ""
+
+def apply_execution_gate(result: dict) -> dict:
+    """
+    Distinguish a visible candidate from an executable entry. Dashboard can still
+    show low-conviction signals, but quote/swap is attempted only after this gate.
+    """
+    if result.get("tier") not in ("SCALP", "MINIMUM", "STRONG"):
+        result["executable"] = False
+        return result
+
+    reasons = []
+    conf = float(result.get("confidence", 0) or 0)
+    age_m = float(result.get("age_m", 0) or 0)
+
+    if conf < EXEC_MIN_CONFIDENCE:
+        reasons.append(f"confidence {conf:.0f}<{EXEC_MIN_CONFIDENCE}")
+    if age_m * 60 < YOUNG_EXEC_MIN_AGE and conf < YOUNG_EXEC_MIN_CONFIDENCE:
+        reasons.append(f"young {age_m:.1f}m<{YOUNG_EXEC_MIN_AGE//60}m needs {YOUNG_EXEC_MIN_CONFIDENCE}+ conf")
+    if result.get("near_migration") and conf < NEAR_MIGRATION_MIN_CONF:
+        reasons.append(f"near-migration requires {NEAR_MIGRATION_MIN_CONF}+ conf")
+    if result.get("repeat_signal"):
+        reasons.append("repeat signal cooldown")
+    if result.get("rug_risk_reason"):
+        reasons.append(result["rug_risk_reason"])
+
+    result["executable"] = not reasons
+    if reasons:
+        result["execution_blocked"] = "; ".join(reasons)
+    return result
 ```
 
 ---
@@ -1139,11 +1285,20 @@ def _fetch_safety_data(addr: str, sym: str) -> dict:
         "audit_score": -1, "lp_pct": -1.0, "lp_burned": False,
         "rug_count": 0, "rug_rate": 0.0, "dev_hold": 0.0,
         "bundle_ath": 0.0, "aped_count": 0, "dev_serial_rug": False,
-        "dev_death_rate": 0.0, "warnings": []
+        "dev_death_rate": 0.0, "warnings": [],
+        "required_ok": {
+            "tokenDetails": False,
+            "devInfo": False,
+            "bundleInfo": False,
+            "apedWallet": False,
+        },
     }
 
     try:
         details = memepump_token_details(addr)
+        if not details:
+            raise ValueError("empty response")
+        result["required_ok"]["tokenDetails"] = True
         result["audit_score"] = float(details.get("auditScore", details.get("score", -1)))
         raw_lp = float(details.get("lpLockedPercent", details.get("lpLockPercent", -1)))
         if raw_lp >= 0:
@@ -1154,6 +1309,9 @@ def _fetch_safety_data(addr: str, sym: str) -> dict:
 
     try:
         dev_info = token_dev_info(addr)
+        if not dev_info:
+            raise ValueError("empty response")
+        result["required_ok"]["devInfo"] = True
         result["rug_count"] = int(dev_info.get("rugPullCount", 0))
         result["rug_rate"]  = float(dev_info.get("rugRate", dev_info.get("rug_rate", 0)))
         result["dev_hold"]  = float(dev_info.get("devHoldingPercent", 0))
@@ -1168,12 +1326,16 @@ def _fetch_safety_data(addr: str, sym: str) -> dict:
 
     try:
         bundle_info = token_bundle_info(addr)
+        if not bundle_info:
+            raise ValueError("empty response")
+        result["required_ok"]["bundleInfo"] = True
         result["bundle_ath"] = float(bundle_info.get("bundlerAthPercent", 0))
     except Exception as e:
         result["warnings"].append(f"bundleInfo: {e}")
 
     try:
         aped = memepump_aped_wallet(addr)
+        result["required_ok"]["apedWallet"] = True
         result["aped_count"] = len(aped)
     except Exception as e:
         result["warnings"].append(f"apedWallet: {e}")
@@ -1203,6 +1365,11 @@ def deep_safety_check(addr: str, sym: str) -> tuple:
         return False, "SAFETY_COOLDOWN (prev rejected)"
 
     d = _fetch_safety_data(addr, sym)
+
+    missing = [name for name, ok in d.get("required_ok", {}).items() if not ok]
+    if missing:
+        mark_safety_rejected(addr)
+        return False, f"SAFETY_DATA_MISSING {','.join(missing)}"
 
     if d["audit_score"] >= 0 and d["audit_score"] < 30:
         mark_safety_rejected(addr)
@@ -1264,6 +1431,13 @@ def detect_signal(token: dict) -> dict:
         raw_trades = trades(addr, limit=200)
     except Exception as e:
         return {"symbol": sym, "addr": addr, "tier": "ERROR", "err": str(e), "t": now}
+
+    sell_pressure, sell_reason = check_recent_sell_pressure(raw_trades)
+    if sell_pressure:
+        push_feed({"symbol": sym, "tier": "REJECTED", "reject_reason": sell_reason, "t": now})
+        return {"symbol": sym, "addr": addr, "tier": "RUG_RISK",
+                "rug_risk_reason": sell_reason, "sig_a": False, "sig_b": False,
+                "sig_c": True, "ratio_c": round(ratio_c, 2), "t": now}
 
     if len(raw_trades) >= 5:
         try:
@@ -1328,11 +1502,11 @@ def detect_signal(token: dict) -> dict:
         return {"symbol": sym, "addr": addr, "tier": "NO_SIGNAL",
                 "sig_a": True, "sig_b": False, "sig_c": True, "t": now}
 
-    live      = candles[0]
-    live_drop = (float(live[4]) - float(live[1])) / max(float(live[1]), 1e-12) * 100
-    if live_drop <= -30:
-        push_feed({"symbol": sym, "tier": "REJECTED", "reject_reason": f"DUMP {live_drop:.0f}%", "t": now})
-        return {"symbol": sym, "addr": addr, "tier": "DEV_SELL", "t": now}
+    crash, crash_reason = check_recent_crash(candles)
+    if crash:
+        push_feed({"symbol": sym, "tier": "REJECTED", "reject_reason": crash_reason, "t": now})
+        return {"symbol": sym, "addr": addr, "tier": "RUG_RISK",
+                "rug_risk_reason": crash_reason, "t": now}
 
     dev_sold, dev_reason = check_dev_sell(candles)
     if dev_sold:
@@ -1404,11 +1578,17 @@ def detect_signal(token: dict) -> dict:
     mc_est    = token.get("_mc", float(token.get("market", {}).get("marketCapUsd", 0) or 0))
     if mc_est > 0 and vol1h_est / mc_est >= 0.20:
         conf += 5
+
+    repeat_signal, repeat_age = _remember_signal(addr)
+    if repeat_signal:
+        conf -= 10
+
     conf = min(conf, 100)
+    conf = max(conf, 0)
 
     entry_price = float(candles[0][4])
 
-    return {
+    result = {
         "symbol": sym, "addr": addr, "tier": tier, "launch": launch_type,
         "sig_a": sig_a, "sig_a_ratio": round(signal_a_ratio, 2),
         "sig_b": sig_b, "sig_b_ratio": round(sig_b_ratio, 2),
@@ -1418,9 +1598,12 @@ def detect_signal(token: dict) -> dict:
         "age_m": round(token["_age"] / 60, 1),
         "confidence": conf,
         "near_migration": near_migration,
+        "repeat_signal": repeat_signal,
+        "repeat_age_s": round(repeat_age, 1) if repeat_age is not None else None,
         "stairstep": stairstep,
         "t": now,
     }
+    return apply_execution_gate(result)
 ```
 
 ---
@@ -1457,6 +1640,13 @@ def try_open_position(result: dict):
     conf       = result.get("confidence", 0)
     sol_amount = SOL_PER_TRADE.get(tier, 0.01)
     slippage   = SLIPPAGE_BUY.get(tier, 10)
+
+    gated = apply_execution_gate(dict(result))
+    if not gated.get("executable", False):
+        push_feed({"sym_note": True,
+                   "msg": f"⛔ {sym} entry gate — {gated.get('execution_blocked', 'not executable')}",
+                   "t": time.strftime("%H:%M:%S")})
+        return
 
     ok, reason = can_enter(sol_amount)
     if not ok:
@@ -1913,6 +2103,11 @@ def scanner_loop():
 
                     # v1.0 fix: 原 sym 变量未定义 bug，改为 result.get("symbol", "?")
                     reflect_on_signal(result.get("symbol", "?"), tier, conf)
+                    if not result.get("executable", False):
+                        push_feed({"sym_note": True,
+                                   "msg": f"👀 WATCH {result.get('symbol', '?')} — {result.get('execution_blocked', 'not executable')}",
+                                   "t": time.strftime("%H:%M:%S")})
+                        continue
                     threading.Thread(
                         target=try_open_position, args=(dict(result),), daemon=True
                     ).start()
@@ -1937,7 +2132,7 @@ DASHBOARD_PORT = 3241
 
 PAGE_HTML = """<!DOCTYPE html>
 <html lang="zh"><head><meta charset="utf-8">
-<title>OXScan — Live Bot v1.0.1</title>
+<title>OXScan — Live Bot v1.0.2</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 html,body{height:100%;overflow:hidden}
@@ -2062,7 +2257,7 @@ body::after{content:'';position:fixed;inset:0;background:repeating-linear-gradie
   </div>
 </div>
 <div id="err-bar"></div>
-<div class="sidebar">OXScan v1.0.1 — <span>Soul READ-ONLY</span> | DynTrail | MomentumDead | VolExhaust | LP Strict</div>
+<div class="sidebar">OXScan v1.0.2 — <span>Soul READ-ONLY</span> | RugGate | DynTrail | MomentumDead | VolExhaust | LP Strict</div>
 <script>
 var lastSeq=0,pnlHistory=[];
 function $(id){return document.getElementById(id)}
@@ -2092,9 +2287,10 @@ function renderFeed(items){
     if(r.sym_note){h+='<div class="frow"><span class="ftime">'+r.t+'</span><span class="fbadge fb-info">INFO</span><span class="fmsg">'+r.msg+'</span></div>';return;}
     var tier=r.tier||'',badge='fb-skip';
     if(tier==='SCALP'||tier==='MINIMUM'||tier==='STRONG')badge='fb-buy';
-    else if(tier==='REJECTED'||tier==='DEV_SELL'||tier==='WASH_SUSPECT')badge='fb-safe';
+    else if(tier==='REJECTED'||tier==='DEV_SELL'||tier==='WASH_SUSPECT'||tier==='RUG_RISK')badge='fb-safe';
     var msg=r.symbol||'';
     if(r.reject_reason)msg+=' '+r.reject_reason;
+    else if(r.execution_blocked)msg+=' WATCH '+r.execution_blocked;
     else if(r.sig_a_ratio)msg+=' A:'+r.sig_a_ratio+'× C:'+r.ratio_c+'×';
     if(r.mc)msg+=' MC$'+(r.mc/1000).toFixed(1)+'K';
     if(r.confidence)msg+=' ['+r.confidence+']';
@@ -2109,7 +2305,8 @@ function renderSignals(sigs){
     var logo=s.logo?'<img src="'+s.logo+'" style="width:18px;height:18px;border-radius:50%;vertical-align:middle"> ':'';
     var mig=s.near_migration?'<span style="color:#ff8c00;font-size:9px">🔥MIGR</span>':'';
     var conf=s.confidence?(s.confidence>=70?'<span style="color:#00e5ff">['+s.confidence+'⭐]</span>':'<span style="color:#1a5060">['+s.confidence+']</span>'):'';
-    h+='<div class="scard"><div class="shead">'+logo+'<span class="sname">'+s.symbol+'</span><span class="tier '+tc+'">'+s.tier+'</span>'+mig+conf+'<span class="stime">'+s.t+'</span></div>';
+    var exec=s.executable?'<span style="color:#00e5ff;font-size:9px">EXEC</span>':'<span style="color:#ff8c00;font-size:9px">WATCH</span>';
+    h+='<div class="scard"><div class="shead">'+logo+'<span class="sname">'+s.symbol+'</span><span class="tier '+tc+'">'+s.tier+'</span>'+mig+conf+exec+'<span class="stime">'+s.t+'</span></div>';
     h+='<div class="sr1"><span class="mc">MC $'+(s.mc/1000).toFixed(1)+'K</span><span class="tp">TP1 $'+(s.tp1_mc/1000).toFixed(1)+'K</span><span class="tp">TP2 $'+(s.tp2_mc/1000).toFixed(1)+'K</span><span class="s1">S1 $'+(s.s1_mc/1000).toFixed(1)+'K</span></div>';
     h+='<div class="sr2">A:'+s.sig_a_ratio+'× B:'+(s.sig_b_ratio||0).toFixed(1)+'× C:'+s.ratio_c+'× age:'+s.age_m+'m</div>';
     h+='<div class="saddr">'+s.addr+'</div></div>';
@@ -2236,7 +2433,7 @@ if __name__ == "__main__":
     dashboard_host = "localhost" if DASHBOARD_HOST == "127.0.0.1" else DASHBOARD_HOST
     dashboard_url = f"http://{dashboard_host}:{DASHBOARD_PORT}"
     print("=" * 60)
-    print("  扫链策略 Live Bot v1.0.1")
+    print("  扫链策略 Live Bot v1.0.2")
     print("  Anti-rug: LP Strict | Bundle 22% | Age 6min | Cooldown 10min")
     print("  Exit: DynTrail 8-20% | MomentumDead | VolExhaust | TP2 45%")
     print(f"  Wallet: {WALLET_ADDRESS[:8]}...{WALLET_ADDRESS[-4:]}")
@@ -2255,7 +2452,7 @@ if __name__ == "__main__":
     print(f"  monitor_loop started (every {MONITOR_SEC}s)")
 
     push_feed({"sym_note": True,
-               "msg": (f"🟢 Bot v1.0.1 started — Soul: {soul.get('name','...')} [{soul.get('stage','Novice')}]  "
+               "msg": (f"🟢 Bot v1.0.2 started — Soul: {soul.get('name','...')} [{soul.get('stage','Novice')}]  "
                        f"SigA:{SIG_A_THRESHOLD}  BS:{BS_MIN}  MC>${MC_MIN/1000:.0f}K-${MC_CAP/1000:.0f}K  "
                        f"Age≥{AGE_HARD_MIN}s  Bundle≤{BUNDLE_ATH_PCT_MAX}%  LP Strict:{LP_LOCK_STRICT}  "
                        f"Monitor:{MONITOR_SEC}s  TP2:{TP2_PCT*100:.0f}%  "
