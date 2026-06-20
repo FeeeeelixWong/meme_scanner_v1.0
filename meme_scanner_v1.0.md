@@ -1,14 +1,15 @@
 ---
 name: scan-live-v1
 description: >
-  扫链策略 Live Bot v1.0.3 — 独立 Python 自动交易机器人（非 MCP 版）。
+  扫链策略 Live Bot v1.0.4 — 独立 Python 自动交易机器人（非 MCP 版）。
   v1.0: 防 rug 强化（LP严格验证/Bundle/Age/冷却表）/
   动态卖点（TP2 45%/动态Trailing 8-20%）/ 新增动量死亡与量能枯竭检测。
   v1.0.2: 低置信/年轻盘/重复信号只观察，实时卖压与短线砸盘硬拦截。
   v1.0.3: 专业扫链看板，区分 WATCH / EXEC / RUG_RISK，强化空状态与数据密度。
+  v1.0.4: Signal Queue / Event Ledger 支持一键复制代币 CA。
   TraderSoul READ-ONLY 分析系统保留。
 
-version: 1.0.3
+version: 1.0.4
 validated: false
 validation_date: 2026-06-20
 validation_results: >
@@ -23,10 +24,11 @@ validation_results: >
   recent sell-pressure checks, short-window crash rejection, repeated-signal downgrade.
   v1.0.3: professional dashboard redesign with KPI strip, signal queue,
   event ledger, position/trade rail, and explicit WATCH/EXEC/RUG labels.
+  v1.0.4: token contract-address copy controls in Signal Queue and Event Ledger.
 
 ---
 
-# 扫链策略 V1.0.3
+# 扫链策略 V1.0.4
 
 > ⚠️ 本 Skill 描述真实交易机器人。使用前确保已理解风险，建议先以极小仓位测试。
 
@@ -2136,7 +2138,7 @@ DASHBOARD_PORT = 3241
 PAGE_HTML = """<!DOCTYPE html>
 <html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>OXScan Command — v1.0.3</title>
+<title>OXScan Command — v1.0.4</title>
 <style>
 :root{
   color-scheme:dark;
@@ -2176,6 +2178,7 @@ body{background:var(--bg);color:var(--text);font:12px/1.45 var(--sans)}
 .scroll{flex:1;min-height:0;overflow:auto}
 .scroll::-webkit-scrollbar{width:8px;height:8px}.scroll::-webkit-scrollbar-thumb{background:#2a3745;border-radius:999px;border:2px solid var(--panel)}
 .feed-row{display:grid;grid-template-columns:52px 94px minmax(0,1fr);align-items:center;gap:10px;padding:9px 12px;border-bottom:1px solid rgba(35,48,61,.72)}
+.feed-row.has-copy{grid-template-columns:52px 94px minmax(0,1fr) 52px}
 .feed-row:hover,.signal-row:hover,.pos-row:hover,.trade-row:hover{background:#151f2a}
 .time{font:11px var(--mono);color:var(--muted)}
 .badge{display:inline-flex;align-items:center;justify-content:center;min-width:72px;height:23px;padding:0 8px;border-radius:5px;font:800 10px var(--mono);letter-spacing:.05em;text-transform:uppercase;border:1px solid var(--line);background:#0b1117;color:var(--soft)}
@@ -2191,7 +2194,13 @@ body{background:var(--bg);color:var(--text);font:12px/1.45 var(--sans)}
 .avatar{width:28px;height:28px;border-radius:7px;background:#182330;border:1px solid #2c3b4a;display:grid;place-items:center;color:var(--soft);font:800 11px var(--mono);overflow:hidden;flex:0 0 auto}
 .avatar img{width:100%;height:100%;object-fit:cover}
 .sig-symbol{font-weight:750;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sig-id{display:flex;align-items:center;gap:7px;min-width:0;margin-top:2px}
 .sig-addr{font:10px var(--mono);color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:220px}
+.ca-copy{height:22px;min-width:38px;padding:0 8px;border:1px solid #314252;border-radius:5px;background:#0b1219;color:#a8b3bd;font:800 10px var(--mono);letter-spacing:.04em;cursor:pointer;transition:background .16s ease,border-color .16s ease,color .16s ease,transform .12s ease}
+.ca-copy:hover{border-color:#4d687b;color:#ecf2f7;background:#111b25}
+.ca-copy:active{transform:translateY(1px)}
+.ca-copy.copied{border-color:#276857;background:#0d1e1a;color:var(--accent)}
+.ca-copy.copy-failed{border-color:#5f2d31;background:#201114;color:var(--danger)}
 .sig-tags{display:flex;gap:6px;align-items:center;justify-content:flex-end;flex-wrap:wrap}
 .metric-line{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:12px}
 .mini{border-top:1px solid rgba(35,48,61,.7);padding-top:8px;min-width:0}
@@ -2267,12 +2276,12 @@ body{background:var(--bg);color:var(--text);font:12px/1.45 var(--sans)}
 
   <div id="err-bar"></div>
   <footer class="footer">
-    <span>OXScan v1.0.3 | RugGate | LP Strict | MomentumDead | VolExhaust</span>
+    <span>OXScan v1.0.4 | RugGate | LP Strict | MomentumDead | VolExhaust</span>
     <span id="session-stats"></span>
   </footer>
 </div>
 <script>
-var lastSeq=0,pnlHistory=[];
+var lastSeq=0,pnlHistory=[],copiedCA='',copiedUntil=0;
 function $(id){return document.getElementById(id)}
 function esc(v){return String(v==null?'':v).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
 function clean(v){return esc(v).replace(/[\\u2600-\\u27BF]|[\\uD83C-\\uDBFF][\\uDC00-\\uDFFF]/g,'').replace(/\\s+/g,' ').trim()}
@@ -2281,6 +2290,24 @@ function num(v,d){v=Number(v||0);return isFinite(v)?v.toFixed(d||0):'0'}
 function shortAddr(a){a=String(a||'');return a.length>14?a.slice(0,6)+'...'+a.slice(-6):a}
 function badgeClass(t, executable){if(t==='RUG_RISK'||t==='DEV_SELL'||t==='WASH_SUSPECT'||t==='REJECTED')return 'risk';if(executable)return 'exec';if(t==='SCALP'||t==='MINIMUM'||t==='STRONG')return 'watch';return 'info'}
 function badge(label, cls){return '<span class="badge '+cls+'">'+esc(label||'INFO')+'</span>'}
+function caCopyButton(addr){addr=String(addr||'');if(!addr)return '';var ok=copiedCA===addr&&Date.now()<copiedUntil;return '<button type="button" class="ca-copy '+(ok?'copied':'')+'" data-copy-ca="'+esc(addr)+'" title="Copy token CA" aria-label="Copy token CA">'+(ok?'COPIED':'CA')+'</button>'}
+function fallbackCopyText(value){
+  return new Promise(function(resolve,reject){
+    var ta=document.createElement('textarea');ta.value=value;ta.setAttribute('readonly','');ta.style.position='fixed';ta.style.left='-9999px';ta.style.opacity='0';document.body.appendChild(ta);ta.select();
+    try{document.execCommand('copy')?resolve():reject(new Error('copy failed'))}catch(e){reject(e)}finally{document.body.removeChild(ta)}
+  });
+}
+function copyText(value){
+  if(navigator.clipboard&&window.isSecureContext)return navigator.clipboard.writeText(value).catch(function(){return fallbackCopyText(value)});
+  return fallbackCopyText(value);
+}
+function wireCopyButtons(){
+  document.addEventListener('click',function(e){
+    var btn=e.target.closest&&e.target.closest('[data-copy-ca]');if(!btn)return;
+    var addr=btn.getAttribute('data-copy-ca')||'';if(!addr)return;
+    copyText(addr).then(function(){copiedCA=addr;copiedUntil=Date.now()+1400;btn.classList.remove('copy-failed');btn.classList.add('copied');btn.textContent='COPIED'}).catch(function(){btn.classList.add('copy-failed');btn.textContent='FAIL'});
+  });
+}
 function empty(title, body){return '<div class="empty"><div><b>'+esc(title)+'</b><span>'+esc(body)+'</span></div></div>'}
 function updateSoul(s){
   if(!s)return;
@@ -2313,7 +2340,7 @@ function renderFeed(items){
     else if(r.sig_a_ratio)msg+=' | A '+num(r.sig_a_ratio,2)+'x / C '+num(r.ratio_c,2)+'x';
     if(r.mc)msg+=' | MC '+money(r.mc);
     if(r.confidence)msg+=' | Cnf '+num(r.confidence,0);
-    return '<div class="feed-row"><div class="time">'+esc(r.t||'')+'</div>'+badge(r.tier||'INFO',cls)+'<div class="feed-msg">'+msg+'</div></div>';
+    return '<div class="feed-row '+(r.addr?'has-copy':'')+'"><div class="time">'+esc(r.t||'')+'</div>'+badge(r.tier||'INFO',cls)+'<div class="feed-msg">'+msg+'</div>'+caCopyButton(r.addr)+'</div>';
   }).join('');
 }
 function renderSignals(sigs){
@@ -2323,7 +2350,7 @@ function renderSignals(sigs){
   $('sig-list').innerHTML=sigs.map(function(s){
     var exec=!!s.executable,cls=badgeClass(s.tier,exec),logo=s.logo?'<img src="'+esc(s.logo)+'" alt="">':esc((s.symbol||'?').slice(0,2).toUpperCase());
     var blocker=s.execution_blocked?'<div class="blocker">'+clean(s.execution_blocked)+'</div>':'';
-    return '<div class="signal-row"><div class="sig-top"><div class="sig-name"><div class="avatar">'+logo+'</div><div><div class="sig-symbol">'+clean(s.symbol||'?')+'</div><div class="sig-addr">'+esc(shortAddr(s.addr))+'</div></div></div><div class="sig-tags">'+badge(s.tier,cls)+badge(exec?'EXEC':'WATCH',exec?'exec':'watch')+'</div></div>'
+    return '<div class="signal-row"><div class="sig-top"><div class="sig-name"><div class="avatar">'+logo+'</div><div><div class="sig-symbol">'+clean(s.symbol||'?')+'</div><div class="sig-id"><div class="sig-addr">'+esc(shortAddr(s.addr))+'</div>'+caCopyButton(s.addr)+'</div></div></div><div class="sig-tags">'+badge(s.tier,cls)+badge(exec?'EXEC':'WATCH',exec?'exec':'watch')+'</div></div>'
       +'<div class="metric-line"><div class="mini"><span>Market Cap</span><b>'+money(s.mc)+'</b></div><div class="mini"><span>Age</span><b>'+num(s.age_m,1)+'m</b></div><div class="mini"><span>Confidence</span><b>'+num(s.confidence,0)+'</b></div><div class="mini"><span>Flow</span><b>A '+num(s.sig_a_ratio,2)+'x</b></div></div>'+blocker+'</div>';
   }).join('');
 }
@@ -2374,7 +2401,7 @@ async function poll(){
     var eb=$('err-bar');eb.textContent='poll error: '+(e&&e.message?e.message:e);eb.style.display='block';$('status-dot').className='dot warn';
   }
 }
-setInterval(poll,2000);poll();
+wireCopyButtons();setInterval(poll,2000);poll();
 </script></body></html>"""
 
 class DashHandler(BaseHTTPRequestHandler):
@@ -2432,7 +2459,7 @@ if __name__ == "__main__":
     dashboard_host = "localhost" if DASHBOARD_HOST == "127.0.0.1" else DASHBOARD_HOST
     dashboard_url = f"http://{dashboard_host}:{DASHBOARD_PORT}"
     print("=" * 60)
-    print("  扫链策略 Live Bot v1.0.3")
+    print("  扫链策略 Live Bot v1.0.4")
     print("  Anti-rug: LP Strict | Bundle 22% | Age 6min | Cooldown 10min")
     print("  Exit: DynTrail 8-20% | MomentumDead | VolExhaust | TP2 45%")
     print(f"  Wallet: {WALLET_ADDRESS[:8]}...{WALLET_ADDRESS[-4:]}")
@@ -2451,7 +2478,7 @@ if __name__ == "__main__":
     print(f"  monitor_loop started (every {MONITOR_SEC}s)")
 
     push_feed({"sym_note": True,
-               "msg": (f"🟢 Bot v1.0.3 started — Soul: {soul.get('name','...')} [{soul.get('stage','Novice')}]  "
+               "msg": (f"🟢 Bot v1.0.4 started — Soul: {soul.get('name','...')} [{soul.get('stage','Novice')}]  "
                        f"SigA:{SIG_A_THRESHOLD}  BS:{BS_MIN}  MC>${MC_MIN/1000:.0f}K-${MC_CAP/1000:.0f}K  "
                        f"Age≥{AGE_HARD_MIN}s  Bundle≤{BUNDLE_ATH_PCT_MAX}%  LP Strict:{LP_LOCK_STRICT}  "
                        f"Monitor:{MONITOR_SEC}s  TP2:{TP2_PCT*100:.0f}%  "
