@@ -6,15 +6,17 @@ description: >
   动态卖点（TP2 45%/动态Trailing 8-20%）/ 新增动量死亡与量能枯竭检测。
   TraderSoul READ-ONLY 分析系统保留。
 
-version: 1.0.0
+version: 1.0.1
 validated: false
-validation_date: 2026-03-24
+validation_date: 2026-06-20
 validation_results: >
   v1.0: LP_LOCK_STRICT=True, BUNDLE_ATH 30→22%, AGE_HARD_MIN 240→360s,
   TOP10_HOLD 40→33%, APED_WALLET 10→6, DEV_HOLD 15→10%, RUG_RATE 30→20%,
   MIN_HOLDERS 25→35, MONITOR_SEC 5→3s. Exit: TP2 25→45%, TP1_SELL SCALP 60→50%,
   dynamic trailing 8-20%, momentum death detection, volume exhaustion detection,
   rejected token 10min cooldown cache.
+  v1.0.1: safe-by-default dry-run mode, explicit ENABLE_LIVE_TRADING=1 gate,
+  localhost dashboard binding by default, clearer env validation, atomic JSON writes.
 
 ---
 
@@ -64,6 +66,8 @@ lines = len(code.splitlines())
 assert lines > 500, f'Extraction too short ({lines} lines) — skill path wrong?'
 print(f'✅ scan_live.py extracted ({lines} lines)')
 "
+python3 -m py_compile scan_live.py
+echo "✅ scan_live.py syntax OK"
 ```
 
 ---
@@ -80,10 +84,12 @@ echo "ℹ️  Keeping existing trader_soul.json (accumulated history preserved)"
 **STEP 4** — Start the bot in background with full logging:
 
 ```bash
+[ -f .env ] && set -a && source .env && set +a
 [ -f ~/.dacs_env_profile ] && source ~/.dacs_env_profile
 PYTHONUNBUFFERED=1 nohup python3 scan_live.py > bot.log 2>&1 &
 BOT_PID=$!
 echo "✅ Bot started (PID $BOT_PID)"
+echo "ℹ️  ENABLE_LIVE_TRADING=${ENABLE_LIVE_TRADING:-0} (0 = dry run / observation mode)"
 sleep 4
 tail -20 bot.log
 ```
@@ -128,12 +134,34 @@ import os, hmac, hashlib, base64, time, json, requests, threading, random
 from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from collections import defaultdict
+from urllib.parse import urlencode
+
+def require_env(name: str) -> str:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise RuntimeError(
+            f"Missing required environment variable: {name}. "
+            "Copy .env.example to .env, fill it in, then run: set -a && source .env && set +a"
+        )
+    return value
+
+def env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 # ── API ───────────────────────────────────────────────────────────────────────
 API_BASE   = "https://web3.okx.com"
-API_KEY    = os.environ["OKX_API_KEY"]
-SECRET_KEY = os.environ["OKX_SECRET_KEY"]
-PASSPHRASE = os.environ["OKX_PASSPHRASE"]
+API_KEY    = require_env("OKX_API_KEY")
+SECRET_KEY = require_env("OKX_SECRET_KEY")
+PASSPHRASE = require_env("OKX_PASSPHRASE")
+
+# ── Runtime safety defaults ───────────────────────────────────────────────────
+# Default is observation mode. Set ENABLE_LIVE_TRADING=1 only after a wallet,
+# API permissions, and risk limits have been deliberately reviewed.
+ENABLE_LIVE_TRADING = env_flag("ENABLE_LIVE_TRADING", default=False)
+DASHBOARD_HOST      = os.environ.get("DASHBOARD_HOST", "127.0.0.1").strip() or "127.0.0.1"
 
 # ── 仓位 ──────────────────────────────────────────────────────────────────────
 SOL_PER_TRADE = {"SCALP": 0.01, "MINIMUM": 0.01, "STRONG": 0.01}
@@ -260,9 +288,10 @@ def _sign(timestamp: str, method: str, path: str, body: str = "") -> dict:
         "Content-Type":         "application/json",
     }
 
-def _get(path: str, params: dict = {}) -> dict:
+def _get(path: str, params: dict | None = None) -> dict:
+    params = params or {}
     ts  = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-    qs  = ("?" + "&".join(f"{k}={v}" for k, v in params.items())) if params else ""
+    qs  = ("?" + urlencode(params)) if params else ""
     hdrs = _sign(ts, "GET", path + qs)
     r = requests.get(API_BASE + path + qs, headers=hdrs, timeout=10)
     r.raise_for_status()
@@ -442,10 +471,15 @@ import base58
 from solders.keypair import Keypair
 from solders.transaction import VersionedTransaction
 
-WALLET_PRIVATE_KEY = os.environ["WALLET_PRIVATE_KEY"]
+WALLET_PRIVATE_KEY = require_env("WALLET_PRIVATE_KEY")
 
 def get_keypair() -> Keypair:
-    raw = base58.b58decode(WALLET_PRIVATE_KEY)
+    try:
+        raw = base58.b58decode(WALLET_PRIVATE_KEY)
+    except Exception as e:
+        raise RuntimeError("Invalid WALLET_PRIVATE_KEY: expected a Base58-encoded Solana private key") from e
+    if len(raw) != 64:
+        raise RuntimeError(f"Invalid WALLET_PRIVATE_KEY length: decoded {len(raw)} bytes, expected 64")
     return Keypair.from_bytes(raw)
 
 def sign_transaction(tx_data: str) -> str:
@@ -491,6 +525,14 @@ MAX_FEED = 600
 POSITIONS_FILE = "scan_positions.json"
 TRADES_FILE    = "scan_trades.json"
 
+def atomic_json_dump(path: str, payload, **kwargs):
+    tmp = f"{path}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(payload, f, **kwargs)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
 def push_feed(row: dict):
     with state_lock:
         state["feed_seq"] += 1
@@ -505,13 +547,11 @@ def sync_positions():
 
 def save_positions():
     with pos_lock:
-        with open(POSITIONS_FILE, "w") as f:
-            json.dump(positions, f, ensure_ascii=False)
+        atomic_json_dump(POSITIONS_FILE, positions, ensure_ascii=False)
 
 def save_trades():
     with state_lock:
-        with open(TRADES_FILE, "w") as f:
-            json.dump(state["trades"], f, ensure_ascii=False)
+        atomic_json_dump(TRADES_FILE, state["trades"], ensure_ascii=False)
 
 def load_on_startup():
     global positions
@@ -594,8 +634,7 @@ def load_soul():
 
 def _save_soul():
     try:
-        with open(SOUL_FILE, "w") as f:
-            json.dump(soul, f, ensure_ascii=False, indent=2)
+        atomic_json_dump(SOUL_FILE, soul, ensure_ascii=False, indent=2)
     except Exception:
         pass
 
@@ -1460,6 +1499,13 @@ def try_open_position(result: dict):
         push_feed({"sym_note": True, "msg": f"⛔ {sym} quote error: {e}", "t": time.strftime("%H:%M:%S")})
         return
 
+    if not ENABLE_LIVE_TRADING:
+        push_feed({"sym_note": True,
+                   "msg": (f"🧪 DRY RUN BUY ${sym} {tier} {sol_amount} SOL @ ${entry_price:.8f} "
+                           f"quote_ok impact:{price_impact:.1f}% — set ENABLE_LIVE_TRADING=1 to broadcast"),
+                   "t": time.strftime("%H:%M:%S")})
+        return
+
     try:
         swap        = swap_instruction(SOL_ADDR, addr, sol_lamports, slippage, WALLET_ADDRESS)
         unsigned_tx = swap.get("tx", "")
@@ -1531,6 +1577,12 @@ def close_position(addr: str, sell_ratio: float, reason: str, current_price: flo
     token_amount = pos["token_amount"]
     sell_amount  = int(token_amount * sell_ratio)
     if sell_amount <= 0: return
+
+    if not ENABLE_LIVE_TRADING:
+        push_feed({"sym_note": True,
+                   "msg": f"🧪 DRY RUN SELL ${sym} {sell_ratio:.0%} skipped — ENABLE_LIVE_TRADING is not 1",
+                   "t": time.strftime("%H:%M:%S")})
+        return
 
     try:
         swap      = swap_instruction(addr, SOL_ADDR, str(sell_amount), SLIPPAGE_SELL, WALLET_ADDRESS)
@@ -2159,16 +2211,16 @@ def run_dashboard():
     import socket, subprocess
     try:
         probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        probe.bind(("0.0.0.0", DASHBOARD_PORT))
+        probe.bind((DASHBOARD_HOST, DASHBOARD_PORT))
         probe.close()
     except OSError:
-        print(f"  ⚠️  Port {DASHBOARD_PORT} busy — killing...")
+        print(f"  ⚠️  {DASHBOARD_HOST}:{DASHBOARD_PORT} busy — killing...")
         subprocess.run(f"lsof -ti:{DASHBOARD_PORT} | xargs kill -9", shell=True, capture_output=True)
         time.sleep(1.5)
 
     HTTPServer.allow_reuse_address = True
     try:
-        server = HTTPServer(("0.0.0.0", DASHBOARD_PORT), DashHandler)
+        server = HTTPServer((DASHBOARD_HOST, DASHBOARD_PORT), DashHandler)
     except OSError as e:
         print(f"  ❌ Dashboard bind failed: {e}")
         raise
@@ -2181,12 +2233,15 @@ def run_dashboard():
 
 ```python
 if __name__ == "__main__":
+    dashboard_host = "localhost" if DASHBOARD_HOST == "127.0.0.1" else DASHBOARD_HOST
+    dashboard_url = f"http://{dashboard_host}:{DASHBOARD_PORT}"
     print("=" * 60)
-    print("  扫链策略 Live Bot v1.0")
+    print("  扫链策略 Live Bot v1.0.1")
     print("  Anti-rug: LP Strict | Bundle 22% | Age 6min | Cooldown 10min")
     print("  Exit: DynTrail 8-20% | MomentumDead | VolExhaust | TP2 45%")
     print(f"  Wallet: {WALLET_ADDRESS[:8]}...{WALLET_ADDRESS[-4:]}")
-    print(f"  Dashboard: http://localhost:{DASHBOARD_PORT}")
+    print(f"  Dashboard: {dashboard_url}")
+    print(f"  Live trading: {'ENABLED' if ENABLE_LIVE_TRADING else 'DRY RUN / observation mode'}")
     print(f"  Max exposure: {MAX_SOL} SOL | Max positions: {MAX_POSITIONS}")
     print("=" * 60)
 
@@ -2200,13 +2255,14 @@ if __name__ == "__main__":
     print(f"  monitor_loop started (every {MONITOR_SEC}s)")
 
     push_feed({"sym_note": True,
-               "msg": (f"🟢 Bot v1.0 started — Soul: {soul.get('name','...')} [{soul.get('stage','Novice')}]  "
+               "msg": (f"🟢 Bot v1.0.1 started — Soul: {soul.get('name','...')} [{soul.get('stage','Novice')}]  "
                        f"SigA:{SIG_A_THRESHOLD}  BS:{BS_MIN}  MC>${MC_MIN/1000:.0f}K-${MC_CAP/1000:.0f}K  "
                        f"Age≥{AGE_HARD_MIN}s  Bundle≤{BUNDLE_ATH_PCT_MAX}%  LP Strict:{LP_LOCK_STRICT}  "
-                       f"Monitor:{MONITOR_SEC}s  TP2:{TP2_PCT*100:.0f}%"),
+                       f"Monitor:{MONITOR_SEC}s  TP2:{TP2_PCT*100:.0f}%  "
+                       f"LiveTrading:{ENABLE_LIVE_TRADING}"),
                "t": time.strftime("%H:%M:%S")})
 
-    print(f"  Dashboard → http://localhost:{DASHBOARD_PORT}")
+    print(f"  Dashboard → {dashboard_url}")
     try:
         run_dashboard()
     except KeyboardInterrupt:

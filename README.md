@@ -12,7 +12,8 @@
 - 💀 动量死亡 + 量能枯竭检测，智能提前锁利
 - ❌ 被拒代币 10 分钟冷却缓存，避免重复检测
 - 🧠 TraderSoul 进化型交易人格系统（只读分析，不干预交易）
-- 🖥️ 实时 Web Dashboard（端口 3241）
+- 🧪 默认观察模式：必须显式 `ENABLE_LIVE_TRADING=1` 才会广播真实交易
+- 🖥️ 实时 Web Dashboard（默认仅监听本机 `127.0.0.1:3241`）
 - 📦 单 `.md` Skill 文件，Claude Code 一键部署
 
 ---
@@ -48,12 +49,28 @@
 ### 第二步：安装依赖
 
 ```bash
-pip install requests solders base58
+python3 -m pip install -r requirements.txt
 ```
 
 ---
 
 ### 第三步：配置环境变量
+
+推荐从模板复制：
+
+```bash
+cp .env.example .env
+$EDITOR .env
+set -a
+source .env
+set +a
+```
+
+默认 `.env.example` 里 `ENABLE_LIVE_TRADING=0`，Bot 只做观察和信号验证，不会签名或广播 swap。确认钱包、API 权限、仓位和风控后，才把它改成：
+
+```bash
+export ENABLE_LIVE_TRADING=1
+```
 
 **Linux / macOS（临时，当前终端有效）：**
 ```bash
@@ -61,6 +78,7 @@ export OKX_API_KEY="你的API Key"
 export OKX_SECRET_KEY="你的Secret Key"
 export OKX_PASSPHRASE="你的Passphrase"
 export WALLET_PRIVATE_KEY="你的Solana钱包私钥(Base58格式)"
+export ENABLE_LIVE_TRADING=0
 ```
 
 **Linux / macOS（永久，重启后依然有效）：**
@@ -70,6 +88,7 @@ export OKX_API_KEY="你的API Key"
 export OKX_SECRET_KEY="你的Secret Key"
 export OKX_PASSPHRASE="你的Passphrase"
 export WALLET_PRIVATE_KEY="你的Solana钱包私钥"
+export ENABLE_LIVE_TRADING=0
 EOF
 source ~/.bashrc
 ```
@@ -80,6 +99,7 @@ $env:OKX_API_KEY="你的API Key"
 $env:OKX_SECRET_KEY="你的Secret Key"
 $env:OKX_PASSPHRASE="你的Passphrase"
 $env:WALLET_PRIVATE_KEY="你的Solana钱包私钥"
+$env:ENABLE_LIVE_TRADING="0"
 ```
 
 ---
@@ -89,21 +109,30 @@ $env:WALLET_PRIVATE_KEY="你的Solana钱包私钥"
 **方式一：克隆完整仓库（推荐）**
 ```bash
 git clone https://github.com/FeeeeelixWong/meme_scanner_v1.0
-cd oxscan-live-bot
+cd meme_scanner_v1.0
 ```
 
 **方式二：只下载 Skill 文件（轻量）**
 ```bash
 # curl
-curl -O https://github.com/FeeeeelixWong/meme_scanner_v1.0/blob/main/meme_scanner_v1.0.md
+curl -L -o meme_scanner_v1.0.md https://raw.githubusercontent.com/FeeeeelixWong/meme_scanner_v1.0/main/meme_scanner_v1.0.md
 
 # 或 wget
-wget https://github.com/FeeeeelixWong/meme_scanner_v1.0/blob/main/meme_scanner_v1.0.md
+wget -O meme_scanner_v1.0.md https://raw.githubusercontent.com/FeeeeelixWong/meme_scanner_v1.0/main/meme_scanner_v1.0.md
 ```
 
 ---
 
-### 第五步：用 Claude Code 部署 Bot
+### 第五步：提取并校验 Bot
+
+可以让 Claude Code 按 Skill 自动部署，也可以先本地提取并做语法校验：
+
+```bash
+python3 scripts/extract_scan_live.py meme_scanner_v1.0.md --output scan_live.py
+python3 -m py_compile scan_live.py
+```
+
+### 第六步：用 Claude Code 部署 Bot
 
 1. 在项目目录下打开 Claude Code
 2. 对 Claude 说：
@@ -115,7 +144,7 @@ wget https://github.com/FeeeeelixWong/meme_scanner_v1.0/blob/main/meme_scanner_v
 
 3. Claude Code 会自动执行 STEP 1-5，完成部署
 
-### 第六步：确认运行正常
+### 第七步：确认运行正常
 
 Bot 启动后，打开浏览器访问：
 
@@ -141,27 +170,19 @@ pkill -f scan_live.py
 
 > 不要上来就用真实仓位跑！
 
-### 第一天：观察模式（极小仓位）
+### 第一天：观察模式（默认）
 
-先把仓位改成极小值，只观察信号质量：
-
-在 `meme_scanner_v1.0.md` 第一部分找到以下内容并临时修改：
-
-```python
-# 改小仓位，先观察
-SOL_PER_TRADE = {"SCALP": 0.001, "MINIMUM": 0.001, "STRONG": 0.001}
-MAX_SOL = 0.05
-```
+保持 `ENABLE_LIVE_TRADING=0`，只观察信号质量。Bot 会完成扫描、安全检查和报价检查，但不会签名或广播交易。
 
 观察 24 小时，确认：
 - [ ] 信号触发频率是否正常（建议每小时 1-5 个）
 - [ ] Safety check 是否在正常拦截可疑代币
 - [ ] Dashboard 数据是否实时更新
-- [ ] 交易能否正常成交
+- [ ] `bot.log` 中没有 API、私钥、dashboard 绑定错误
 
 ### 第二天：小仓位实盘
 
-确认信号质量后，使用默认配置（0.01 SOL/笔）运行 2-3 天，观察胜率和 PnL 曲线。
+确认信号质量后，再设置 `ENABLE_LIVE_TRADING=1`，使用默认配置（0.01 SOL/笔）运行 2-3 天，观察胜率和 PnL 曲线。
 
 ### 第三天之后：按表现调整
 
@@ -183,6 +204,8 @@ MAX_SOL = 0.05
 | `TRAILING_DROP` | 8-20% | 动态 Trailing Stop 幅度 |
 | `MAX_HOLD_MIN` | 30min | 最大持仓时间 |
 | `MONITOR_SEC` | 3s | 持仓监控间隔 |
+| `ENABLE_LIVE_TRADING` | `0` | `1` 时才会签名并广播真实交易 |
+| `DASHBOARD_HOST` | `127.0.0.1` | Dashboard 监听地址；不建议公开到公网 |
 
 ---
 
@@ -230,7 +253,7 @@ tail -50 bot.log
 **Q: 出现 `ModuleNotFoundError`？**
 
 ```bash
-pip3 install requests solders base58
+python3 -m pip install -r requirements.txt
 ```
 
 ---
