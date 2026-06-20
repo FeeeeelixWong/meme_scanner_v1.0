@@ -168,6 +168,16 @@ dmypy.json
 # Cython debug symbols
 cython_debug/
 
+# Meme Scanner generated/runtime files
+scan_live.py
+scan_positions.json
+scan_positions.json.tmp
+scan_trades.json
+scan_trades.json.tmp
+trader_soul.json
+trader_soul.json.tmp
+bot.log
+
 # PyCharm
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
